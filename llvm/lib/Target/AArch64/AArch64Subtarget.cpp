@@ -70,6 +70,11 @@ static cl::opt<bool> ForceStreamingCompatibleSVE(
         "Force the use of streaming-compatible SVE code for all functions"),
     cl::Hidden);
 
+static cl::opt<bool>
+    EnableMachinePipeliner("aarch64-enable-pipeliner",
+                           cl::desc("Enable Machine Pipeliner for AArch64"),
+                           cl::init(false), cl::Hidden);
+
 unsigned AArch64Subtarget::getVectorInsertExtractBaseCost() const {
   if (OverrideVectorInsertExtractBaseCost.getNumOccurrences() > 0)
     return OverrideVectorInsertExtractBaseCost;
@@ -489,4 +494,8 @@ bool AArch64Subtarget::isSVEAvailable() const{
   // FIXME: Also return false if FEAT_FA64 is set, but we can't do this yet
   // as we don't yet support the feature in LLVM.
   return hasSVE() && !isStreaming() && !isStreamingCompatible();
+}
+
+bool AArch64Subtarget::enableMachinePipeliner() const {
+  return getSchedModel().hasInstrSchedModel() && EnableMachinePipeliner;
 }

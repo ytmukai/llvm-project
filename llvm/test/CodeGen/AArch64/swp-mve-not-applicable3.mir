@@ -1,0 +1,71 @@
+# RUN: llc --verify-machineinstrs -mtriple=aarch64 -o - %s -run-pass pipeliner -aarch64-enable-pipeliner -pipeliner-mve-cg -debug-only=pipeliner 2>&1 | FileCheck %s
+
+# Phi definition is referenced outside the loop
+# CHECK: Can not apply MVE expander
+---
+name:            test
+tracksRegLiveness: true
+body:             |
+  ; CHECK-LABEL: name: test
+  ; CHECK: bb.0:
+  ; CHECK-NEXT:   successors: %bb.3(0x80000000)
+  ; CHECK-NEXT:   liveins: $x0
+  ; CHECK-NEXT: {{  $}}
+  ; CHECK-NEXT:   [[COPY:%[0-9]+]]:gpr64sp = COPY $x0
+  ; CHECK-NEXT:   [[FMOVD0_:%[0-9]+]]:fpr64 = FMOVD0
+  ; CHECK-NEXT:   [[FMOVDi:%[0-9]+]]:fpr64 = FMOVDi 8
+  ; CHECK-NEXT:   B %bb.3
+  ; CHECK-NEXT: {{  $}}
+  ; CHECK-NEXT: bb.3:
+  ; CHECK-NEXT:   successors: %bb.4(0x80000000), %bb.5(0x00000000)
+  ; CHECK-NEXT: {{  $}}
+  ; CHECK-NEXT:   [[FMADDDrrr:%[0-9]+]]:fpr64 = nofpexcept FMADDDrrr [[FMOVDi]], [[FMOVDi]], [[FMOVDi]], implicit $fpcr
+  ; CHECK-NEXT:   [[SUBSXri:%[0-9]+]]:gpr64 = nsw SUBSXri [[COPY]], 1, 0, implicit-def $nzcv
+  ; CHECK-NEXT:   [[COPY1:%[0-9]+]]:gpr64all = COPY [[SUBSXri]]
+  ; CHECK-NEXT:   Bcc 0, %bb.5, implicit $nzcv
+  ; CHECK-NEXT:   B %bb.4
+  ; CHECK-NEXT: {{  $}}
+  ; CHECK-NEXT: bb.4:
+  ; CHECK-NEXT:   successors: %bb.5(0x40000000), %bb.4(0x40000000)
+  ; CHECK-NEXT: {{  $}}
+  ; CHECK-NEXT:   [[PHI:%[0-9]+]]:gpr64sp = PHI [[COPY1]], %bb.3, %15, %bb.4
+  ; CHECK-NEXT:   [[PHI1:%[0-9]+]]:fpr64 = PHI [[FMOVD0_]], %bb.3, %13, %bb.4
+  ; CHECK-NEXT:   [[PHI2:%[0-9]+]]:fpr64 = PHI [[FMADDDrrr]], %bb.3, %12, %bb.4
+  ; CHECK-NEXT:   [[FMADDDrrr1:%[0-9]+]]:fpr64 = nofpexcept FMADDDrrr [[FMOVDi]], [[FMOVDi]], [[FMOVDi]], implicit $fpcr
+  ; CHECK-NEXT:   [[FADDDrr:%[0-9]+]]:fpr64 = nofpexcept FADDDrr [[PHI1]], [[PHI2]], implicit $fpcr
+  ; CHECK-NEXT:   [[SUBSXri1:%[0-9]+]]:gpr64 = nsw SUBSXri [[PHI]], 1, 0, implicit-def $nzcv
+  ; CHECK-NEXT:   [[COPY2:%[0-9]+]]:gpr64all = COPY [[SUBSXri1]]
+  ; CHECK-NEXT:   Bcc 0, %bb.5, implicit $nzcv
+  ; CHECK-NEXT:   B %bb.4
+  ; CHECK-NEXT: {{  $}}
+  ; CHECK-NEXT: bb.5:
+  ; CHECK-NEXT:   successors: %bb.2(0x80000000)
+  ; CHECK-NEXT: {{  $}}
+  ; CHECK-NEXT:   [[PHI3:%[0-9]+]]:fpr64 = PHI [[FMOVD0_]], %bb.3, [[FADDDrr]], %bb.4
+  ; CHECK-NEXT:   B %bb.2
+  ; CHECK-NEXT: {{  $}}
+  ; CHECK-NEXT: bb.2:
+  ; CHECK-NEXT:   $d0 = COPY [[PHI3]]
+  ; CHECK-NEXT:   RET_ReallyLR implicit $d0
+  bb.0:
+    liveins: $x0
+
+    %0:gpr64all = COPY $x0
+    %13:fpr64 = FMOVD0
+    %17:fpr64 = FMOVDi 8
+    B %bb.1
+
+  bb.1:
+    %2:gpr64sp = PHI %0, %bb.0, %7, %bb.1
+    %4:fpr64 = PHI %13, %bb.0, %5, %bb.1
+    %22:fpr64 = nofpexcept FMADDDrrr %17, %17, %17, implicit $fpcr
+    %5:fpr64 = nofpexcept FADDDrr %4, killed %22, implicit $fpcr
+    %23:gpr64 = nsw SUBSXri %2, 1, 0, implicit-def $nzcv
+    %7:gpr64all = COPY %23
+    Bcc 0, %bb.2, implicit $nzcv
+    B %bb.1
+
+  bb.2:
+    $d0 = COPY %4
+    RET_ReallyLR implicit $d0
+...

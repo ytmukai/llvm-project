@@ -8586,6 +8586,277 @@ bool AArch64InstrInfo::isReallyTriviallyReMaterializable(
   return TargetInstrInfo::isReallyTriviallyReMaterializable(MI);
 }
 
+namespace {
+class AArch64PipelinerLoopInfo : public TargetInstrInfo::PipelinerLoopInfo {
+  /// The SUBS instruction that reduces the counter and determines the loop
+  /// condition.
+  MachineInstr *Subs;
+  /// The initial value of the loop counter
+  Register CounterInit;
+  /// An argument for insertBranch() to insert b.eq
+  SmallVector<MachineOperand, 4> CondEQ;
+  MachineFunction *MF;
+  const TargetInstrInfo *TII;
+  const TargetRegisterInfo *TRI;
+  MachineRegisterInfo &MRI;
+
+  Register getSuitableReg(Register OrigReg, const TargetRegisterClass *DestRC,
+                          MachineBasicBlock *MBB,
+                          MachineBasicBlock::iterator InsertTo);
+
+public:
+  AArch64PipelinerLoopInfo(MachineInstr *Subs, Register LoopCounterInit,
+                           const SmallVectorImpl<MachineOperand> &CondEQ)
+      : Subs(Subs), CounterInit(LoopCounterInit),
+        CondEQ(CondEQ.begin(), CondEQ.end()),
+        MF(Subs->getParent()->getParent()),
+        TII(MF->getSubtarget().getInstrInfo()),
+        TRI(MF->getSubtarget().getRegisterInfo()), MRI(MF->getRegInfo()) {}
+
+  bool shouldIgnoreForPipelining(const MachineInstr *MI) const override {
+    // Make the instructions for loop control be placed in stage 0.
+    return MI == Subs;
+  }
+
+  std::optional<bool> createTripCountGreaterCondition(
+      int TC, MachineBasicBlock &MBB,
+      SmallVectorImpl<MachineOperand> &Cond) override {
+    // A SUBS instruction that compares the counter to 0 is already placed.
+    // Since a branch instruction will be inserted as "if (Cond) goto epilogue",
+    // Cond is set to be true when the counter is 0.
+    Cond = CondEQ;
+    return {};
+  }
+
+  std::optional<bool>
+  createTripCountGreaterCondition(int TC, MachineBasicBlock &MBB,
+                                  SmallVectorImpl<MachineOperand> &Cond,
+                                  Register CounterReg) override;
+
+  void setPreheader(MachineBasicBlock *NewPreheader) override {}
+
+  void adjustTripCount(int TripCountAdjust) override {}
+
+  void disposed() override {}
+
+  Register getCounterInitReg() override { return CounterInit; }
+
+  Register getCounterUpdatedReg() override {
+    return Subs->getOperand(0).getReg();
+  }
+};
+} // namespace
+
+/// Returns a register matching DestRC based on OrigReg.
+/// If a COPY is needed it will be inserted into InsertTo.
+Register AArch64PipelinerLoopInfo::getSuitableReg(
+    Register OrigReg, const TargetRegisterClass *DestRC, MachineBasicBlock *MBB,
+    MachineBasicBlock::iterator InsertTo) {
+  if (OrigReg.isVirtual() && DestRC->hasSubClassEq(MRI.getRegClass(OrigReg)))
+    return OrigReg;
+  if (OrigReg.isPhysical() && DestRC->contains(OrigReg))
+    return OrigReg;
+
+  Register Copy = MRI.createVirtualRegister(DestRC);
+  BuildMI(*MBB, InsertTo, DebugLoc(), TII->get(AArch64::COPY))
+      .addReg(Copy, RegState::Define)
+      .addReg(OrigReg);
+
+  return Copy;
+}
+
+std::optional<bool> AArch64PipelinerLoopInfo::createTripCountGreaterCondition(
+    int TC, MachineBasicBlock &MBB, SmallVectorImpl<MachineOperand> &Cond,
+    Register CounterReg) {
+  // Since the structure of the loop is "counter -= imm; if (counter != 0)
+  // loop;", it can be implemented as "counter > TC*imm" to determine if the
+  // remaining trip count represented by CounterReg is greater than TC.
+
+  int SubImm = Subs->getOperand(2).getImm();
+  int ShiftImm = Subs->getOperand(3).getImm();
+  int TCAdjusted = SubImm * TC;
+  bool IsReg32 = Subs->getOpcode() == AArch64::SUBSWri;
+  Register ZeroReg = IsReg32 ? AArch64::WZR : AArch64::XZR;
+
+  if (TCAdjusted <= 4095) {
+    // Can be implemented by SUBS[XW]ri
+    CounterReg = getSuitableReg(
+        CounterReg, TII->getRegClass(Subs->getDesc(), 1, TRI, *MBB.getParent()),
+        &MBB, MBB.end());
+    BuildMI(MBB, MBB.end(), Subs->getDebugLoc(), Subs->getDesc())
+        .addReg(ZeroReg, RegState::Define | RegState::Dead)
+        .addReg(CounterReg)
+        .addImm(TCAdjusted)
+        .addImm(ShiftImm);
+  } else {
+    // Use the mult instruction to calculate TCAdusted
+
+    // Since TC is given as a value based on the number of pipeline stages,
+    // exceeding the immediate range of mov does not occur practically.
+    assert(TC <= 65535);
+
+    const MCInstrDesc &MovDesc =
+        IsReg32 ? TII->get(AArch64::MOVZWi) : TII->get(AArch64::MOVZXi);
+    Register TCReg = MRI.createVirtualRegister(
+        TII->getRegClass(MovDesc, 0, TRI, *MBB.getParent()));
+    BuildMI(MBB, MBB.end(), Subs->getDebugLoc(), MovDesc)
+        .addReg(TCReg, RegState::Define)
+        .addImm(TC)
+        .addImm(0);
+    Register SubImmReg = MRI.createVirtualRegister(
+        TII->getRegClass(MovDesc, 0, TRI, *MBB.getParent()));
+    BuildMI(MBB, MBB.end(), Subs->getDebugLoc(), MovDesc)
+        .addReg(SubImmReg, RegState::Define)
+        .addImm(SubImm)
+        .addImm(0);
+    const MCInstrDesc &MultDesc =
+        IsReg32 ? TII->get(AArch64::MADDWrrr) : TII->get(AArch64::MADDXrrr);
+    TCReg = getSuitableReg(TCReg,
+                           TII->getRegClass(MultDesc, 1, TRI, *MBB.getParent()),
+                           &MBB, MBB.end());
+    Register TCAdjustedReg = MRI.createVirtualRegister(
+        TII->getRegClass(MultDesc, 0, TRI, *MBB.getParent()));
+    BuildMI(MBB, MBB.end(), Subs->getDebugLoc(), MultDesc)
+        .addReg(TCAdjustedReg, RegState::Define)
+        .addReg(TCReg)
+        .addReg(SubImmReg)
+        .addReg(ZeroReg);
+    const MCInstrDesc &SubsDesc = Subs->getOpcode() == AArch64::SUBSWri
+                                      ? TII->get(AArch64::SUBSWrs)
+                                      : TII->get(AArch64::SUBSXrs);
+    CounterReg = getSuitableReg(
+        CounterReg, TII->getRegClass(SubsDesc, 1, TRI, *MBB.getParent()), &MBB,
+        MBB.end());
+    TCAdjustedReg = getSuitableReg(
+        TCAdjustedReg, TII->getRegClass(SubsDesc, 2, TRI, *MBB.getParent()),
+        &MBB, MBB.end());
+    BuildMI(MBB, MBB.end(), Subs->getDebugLoc(), SubsDesc)
+        .addReg(ZeroReg, RegState::Define | RegState::Dead)
+        .addReg(CounterReg)
+        .addReg(TCAdjustedReg)
+        .addImm(AArch64_AM::getShifterImm(AArch64_AM::LSL, ShiftImm ? 12 : 0));
+  }
+
+  Cond.clear();
+  Cond.push_back(MachineOperand::CreateImm(AArch64CC::GT));
+
+  return {};
+}
+
+static void extractPhiReg(MachineInstr &Phi, MachineBasicBlock *MBB,
+                          Register *RegMBB, Register *RegOther) {
+  assert(Phi.getNumOperands() == 5);
+  if (Phi.getOperand(2).getMBB() == MBB) {
+    *RegMBB = Phi.getOperand(1).getReg();
+    *RegOther = Phi.getOperand(3).getReg();
+  } else {
+    assert(Phi.getOperand(4).getMBB() == MBB);
+    *RegMBB = Phi.getOperand(3).getReg();
+    *RegOther = Phi.getOperand(1).getReg();
+  }
+}
+
+/// If Reg is updated recursively by a single SUBS instruction,
+/// returns true and sets UpdateInst and InitReg.
+static bool getIndVarInfo(Register Reg, MachineBasicBlock *LoopBB,
+                          MachineInstr **UpdateInst, Register *InitReg) {
+  if (LoopBB->pred_size() != 2)
+    return false;
+  if (!Reg.isVirtual())
+    return false;
+  const MachineRegisterInfo &MRI = LoopBB->getParent()->getRegInfo();
+  *UpdateInst = nullptr;
+  *InitReg = 0;
+  Register CurReg = Reg;
+  while (true) {
+    MachineInstr *Def = MRI.getVRegDef(CurReg);
+    if (Def->getParent() != LoopBB)
+      return false;
+    if (Def->isCopy())
+      CurReg = Def->getOperand(1).getReg();
+    else if (Def->isPHI()) {
+      if (*InitReg != 0)
+        return false;
+      extractPhiReg(*Def, LoopBB, &CurReg, InitReg);
+    } else if (Def->getOpcode() == AArch64::SUBSWri ||
+               Def->getOpcode() == AArch64::SUBSXri) {
+      if (*UpdateInst)
+        return false;
+      *UpdateInst = Def;
+      CurReg = Def->getOperand(1).getReg();
+    } else
+      return false;
+
+    if (!CurReg.isVirtual())
+      return false;
+    if (Reg == CurReg)
+      break;
+  }
+
+  return true;
+}
+
+std::unique_ptr<TargetInstrInfo::PipelinerLoopInfo>
+AArch64InstrInfo::analyzeLoopForPipelining(MachineBasicBlock *LoopBB) const {
+  // Accept only loops of the following forms:
+  // .loop:
+  //   subs counter, counter, imm
+  //   b.ne .loop
+  // or
+  // .loop:
+  //   subs counter, counter, imm
+  //   b.eq .end
+  //   b .loop
+  //
+  // TODO: Accept cases where the subtraction value is not constant or where
+  // there is a comparison separate from the counter subtraction
+
+  MachineBasicBlock *TBB, *FBB;
+  SmallVector<MachineOperand, 4> Cond, CondEQ;
+  if (analyzeBranch(*LoopBB, TBB, FBB, Cond))
+    return nullptr;
+
+  if (Cond.size() != 1)
+    return nullptr;
+
+  switch (Cond[0].getImm()) {
+  default:
+    return nullptr;
+  case AArch64CC::EQ:
+    if (TBB == LoopBB || FBB != LoopBB)
+      return nullptr;
+    CondEQ = Cond;
+    break;
+  case AArch64CC::NE:
+    if (TBB != LoopBB || FBB == LoopBB)
+      return nullptr;
+    CondEQ = Cond;
+    reverseBranchCondition(CondEQ);
+    break;
+  }
+
+  const TargetRegisterInfo &TRI = getRegisterInfo();
+  MachineInstr *Subs;
+  for (MachineInstr &MI : reverse(*LoopBB)) {
+    if (MI.modifiesRegister(AArch64::NZCV, &TRI)) {
+      if (MI.getOpcode() != AArch64::SUBSWri &&
+          MI.getOpcode() != AArch64::SUBSXri)
+        return nullptr;
+      Subs = &MI;
+      break;
+    }
+  }
+  MachineInstr *IndVarUpdate;
+  Register InitReg;
+  if (!getIndVarInfo(Subs->getOperand(1).getReg(), LoopBB, &IndVarUpdate,
+                     &InitReg))
+    return nullptr;
+  if (Subs != IndVarUpdate)
+    return nullptr;
+
+  return std::make_unique<AArch64PipelinerLoopInfo>(Subs, InitReg, CondEQ);
+}
+
 #define GET_INSTRINFO_HELPERS
 #define GET_INSTRMAP_INFO
 #include "AArch64GenInstrInfo.inc"
