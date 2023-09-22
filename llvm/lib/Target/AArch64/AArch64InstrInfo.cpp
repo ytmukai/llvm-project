@@ -8628,10 +8628,9 @@ public:
     return {};
   }
 
-  std::optional<bool>
-  createTripCountGreaterCondition(int TC, MachineBasicBlock &MBB,
-                                  SmallVectorImpl<MachineOperand> &Cond,
-                                  Register CounterReg) override;
+  void createRemainingIterationsGreaterCondition(
+      int TC, MachineBasicBlock &MBB, SmallVectorImpl<MachineOperand> &Cond,
+      DenseMap<unsigned, unsigned> RegMap) override;
 
   void setPreheader(MachineBasicBlock *NewPreheader) override {}
 
@@ -8639,11 +8638,7 @@ public:
 
   void disposed() override {}
 
-  Register getCounterInitReg() override { return CounterInit; }
-
-  Register getCounterUpdatedReg() override {
-    return Subs->getOperand(0).getReg();
-  }
+  bool isMVEExpanderSupported() override { return true; }
 };
 } // namespace
 
@@ -8665,12 +8660,19 @@ Register AArch64PipelinerLoopInfo::getSuitableReg(
   return Copy;
 }
 
-std::optional<bool> AArch64PipelinerLoopInfo::createTripCountGreaterCondition(
+void AArch64PipelinerLoopInfo::createRemainingIterationsGreaterCondition(
     int TC, MachineBasicBlock &MBB, SmallVectorImpl<MachineOperand> &Cond,
-    Register CounterReg) {
+    DenseMap<unsigned, unsigned> RegMap) {
   // Since the structure of the loop is "counter -= imm; if (counter != 0)
   // loop;", it can be implemented as "counter > TC*imm" to determine if the
   // remaining trip count represented by CounterReg is greater than TC.
+
+  Register CounterReg;
+  if (RegMap.empty())
+    CounterReg = CounterInit;
+  else
+    CounterReg = RegMap[Subs->getOperand(0).getReg()];
+  assert(CounterReg.isValid());
 
   int SubImm = Subs->getOperand(2).getImm();
   int ShiftImm = Subs->getOperand(3).getImm();
@@ -8739,8 +8741,6 @@ std::optional<bool> AArch64PipelinerLoopInfo::createTripCountGreaterCondition(
 
   Cond.clear();
   Cond.push_back(MachineOperand::CreateImm(AArch64CC::GT));
-
-  return {};
 }
 
 static void extractPhiReg(MachineInstr &Phi, MachineBasicBlock *MBB,
