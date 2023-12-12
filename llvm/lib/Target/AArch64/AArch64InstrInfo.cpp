@@ -9570,6 +9570,97 @@ AArch64InstrInfo::probedStackAlloc(MachineBasicBlock::iterator MBBI,
   return ExitMBB->begin();
 }
 
+namespace {
+class AArch64PipelinerLoopInfo : public TargetInstrInfo::PipelinerLoopInfo {
+  /// The compare instruction handling the branch
+  MachineInstr *Comp;
+  /// An argument for insertBranch() to insert b.eq
+  SmallVector<MachineOperand, 4> CondEQ;
+
+public:
+  AArch64PipelinerLoopInfo(MachineInstr *Comp,
+                           const SmallVectorImpl<MachineOperand> &CondEQ)
+      : Comp(Comp), CondEQ(CondEQ.begin(), CondEQ.end()) {}
+
+  bool shouldIgnoreForPipelining(const MachineInstr *MI) const override {
+    // Make the instructions for loop control be placed in stage 0.
+    return MI == Comp;
+  }
+
+  std::optional<bool> createTripCountGreaterCondition(
+      int TC, MachineBasicBlock &MBB,
+      SmallVectorImpl<MachineOperand> &Cond) override {
+    // A branch instruction will be inserted as "if (Cond) goto epilogue".
+    // CondEQ is Normalized for such use.
+    // The compare instruction is assumed to have already been inserted.
+    Cond = CondEQ;
+    return {};
+  }
+
+  void setPreheader(MachineBasicBlock *NewPreheader) override {}
+
+  void adjustTripCount(int TripCountAdjust) override {}
+
+  void disposed() override {}
+};
+} // namespace
+
+std::unique_ptr<TargetInstrInfo::PipelinerLoopInfo>
+AArch64InstrInfo::analyzeLoopForPipelining(MachineBasicBlock *LoopBB) const {
+  MachineBasicBlock *TBB, *FBB;
+  SmallVector<MachineOperand, 4> Cond, CondEQ;
+  if (analyzeBranch(*LoopBB, TBB, FBB, Cond))
+    return nullptr;
+
+  if (Cond.size() != 1)
+    return nullptr;
+
+  switch (Cond[0].getImm()) {
+  default:
+    return nullptr;
+  case AArch64CC::EQ:
+    if (TBB == LoopBB || FBB != LoopBB)
+      return nullptr;
+    CondEQ = Cond;
+    break;
+  case AArch64CC::NE:
+    if (TBB != LoopBB || FBB == LoopBB)
+      return nullptr;
+    CondEQ = Cond;
+    reverseBranchCondition(CondEQ);
+    break;
+  }
+
+  const TargetRegisterInfo &TRI = getRegisterInfo();
+  const MachineRegisterInfo &MRI = LoopBB->getParent()->getRegInfo();
+  MachineInstr *Comp = nullptr;
+  for (MachineInstr &MI : reverse(*LoopBB)) {
+    if (MI.modifiesRegister(AArch64::NZCV, &TRI)) {
+      Register SrcReg, SrcReg2;
+      int64_t CmpMask, CmpValue;
+      if (!analyzeCompare(MI, SrcReg, SrcReg2, CmpMask, CmpValue))
+        return nullptr;
+
+      auto IsLoopInvariant = [&](Register &Reg) -> bool {
+        if (Reg == 0)
+          return true;
+        if (Reg.isVirtual() && MRI.getVRegDef(Reg)->getParent() == LoopBB)
+          return true;
+        return false;
+      };
+      if (!IsLoopInvariant(SrcReg) && !IsLoopInvariant(SrcReg2))
+        return nullptr;
+
+      Comp = &MI;
+      break;
+    }
+  }
+  if (Comp == nullptr)
+    return nullptr;
+
+  return std::make_unique<AArch64PipelinerLoopInfo>(Comp, CondEQ);
+}
+
 #define GET_INSTRINFO_HELPERS
 #define GET_INSTRMAP_INFO
 #include "AArch64GenInstrInfo.inc"
