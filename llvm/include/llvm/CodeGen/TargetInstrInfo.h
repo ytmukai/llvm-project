@@ -776,7 +776,7 @@ public:
     /// empty and the compared value is the initial value of the trip count.
     virtual void createRemainingIterationsGreaterCondition(
         int TC, MachineBasicBlock &MBB, SmallVectorImpl<MachineOperand> &Cond,
-        DenseMap<unsigned, unsigned> RegMap) = 0;
+        DenseMap<MachineInstr *, MachineInstr *> LastStage0Insts) = 0;
 
     /// Modify the loop such that the trip count is
     /// OriginalTC + TripCountAdjust.
