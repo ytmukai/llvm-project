@@ -15,8 +15,10 @@
 #include "AArch64FrameLowering.h"
 #include "AArch64MachineFunctionInfo.h"
 #include "AArch64PointerAuth.h"
+#include "AArch64RegisterInfo.h"
 #include "AArch64Subtarget.h"
 #include "MCTargetDesc/AArch64AddressingModes.h"
+#include "MCTargetDesc/AArch64MCTargetDesc.h"
 #include "Utils/AArch64BaseInfo.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/STLExtras.h"
@@ -9578,10 +9580,43 @@ class AArch64PipelinerLoopInfo : public TargetInstrInfo::PipelinerLoopInfo {
   MachineInstr *PredBranch;
   SmallVector<MachineOperand, 4> Cond;
 
+  MachineFunction *MF;
+  const TargetInstrInfo *TII;
+  const TargetRegisterInfo *TRI;
+  MachineRegisterInfo &MRI;
+
+  struct {
+    MachineInstr *CondBranch;
+    MachineInstr *Comp;
+    unsigned CompCounterOprNum;
+    MachineInstr *Update;
+    unsigned UpdateCounterOprNum;
+    Register Init;
+    bool IsUpdatePriorComp;
+    bool IsLoopCondTrue;
+  } MVELoopInfo;
+
 public:
   AArch64PipelinerLoopInfo(MachineInstr *PredBranch,
                            const SmallVectorImpl<MachineOperand> &Cond)
-      : PredBranch(PredBranch), Cond(Cond.begin(), Cond.end()) {}
+      : PredBranch(PredBranch), Cond(Cond.begin(), Cond.end()),
+        MF(PredBranch->getParent()->getParent()),
+        TII(MF->getSubtarget().getInstrInfo()),
+        TRI(MF->getSubtarget().getRegisterInfo()), MRI(MF->getRegInfo()) {}
+
+  AArch64PipelinerLoopInfo(MachineInstr *PredBranch,
+                           const SmallVectorImpl<MachineOperand> &Cond,
+                           MachineInstr *CondBranch, MachineInstr *Comp,
+                           unsigned CompCounterOprNum, MachineInstr *Update,
+                           unsigned UpdateCounterOprNum, Register Init,
+                           bool IsUpdatePriorComp, bool IsLoopCondTrue)
+      : PredBranch(PredBranch), Cond(Cond.begin(), Cond.end()),
+        MF(Comp->getParent()->getParent()),
+        TII(MF->getSubtarget().getInstrInfo()),
+        TRI(MF->getSubtarget().getRegisterInfo()), MRI(MF->getRegInfo()),
+        MVELoopInfo({CondBranch, Comp, CompCounterOprNum, Update,
+                     UpdateCounterOprNum, Init, IsUpdatePriorComp,
+                     IsLoopCondTrue}) {}
 
   bool shouldIgnoreForPipelining(const MachineInstr *MI) const override {
     // Make the instructions for loop control be placed in stage 0.
@@ -9599,11 +9634,16 @@ public:
     return {};
   }
 
+  void createRemainingIterationsGreaterCondition(
+      int TC, MachineBasicBlock &MBB, SmallVectorImpl<MachineOperand> &Cond,
+      DenseMap<MachineInstr *, MachineInstr *> LastStage0Insts) override;
+
   void setPreheader(MachineBasicBlock *NewPreheader) override {}
 
   void adjustTripCount(int TripCountAdjust) override {}
 
   void disposed() override {}
+  bool isMVEExpanderSupported() override { return true; }
 };
 } // namespace
 
@@ -9620,6 +9660,233 @@ static bool isCompareAndBranch(unsigned Opcode) {
     return true;
   }
   return false;
+}
+
+/// Returns a register matching DestRC based on OrigReg.
+/// If a COPY is needed it will be inserted into InsertTo.
+static Register getSuitableReg(Register OrigReg,
+                               const TargetRegisterClass *DestRC,
+                               MachineBasicBlock *MBB,
+                               MachineBasicBlock::iterator InsertTo) {
+  MachineRegisterInfo &MRI = MBB->getParent()->getRegInfo();
+  const TargetInstrInfo *TII = MBB->getParent()->getSubtarget().getInstrInfo();
+  if (OrigReg.isVirtual() && DestRC->hasSubClassEq(MRI.getRegClass(OrigReg)))
+    return OrigReg;
+  if (OrigReg.isPhysical() && DestRC->contains(OrigReg))
+    return OrigReg;
+
+  Register Copy = MRI.createVirtualRegister(DestRC);
+  BuildMI(*MBB, InsertTo, DebugLoc(), TII->get(AArch64::COPY))
+      .addReg(Copy, RegState::Define)
+      .addReg(OrigReg);
+
+  return Copy;
+}
+
+static Register getSuitableReg(Register OrigReg, const MCInstrDesc &Desc,
+                               unsigned OpNum, MachineBasicBlock *MBB,
+                               MachineBasicBlock::iterator InsertTo) {
+  const TargetInstrInfo *TII = MBB->getParent()->getSubtarget().getInstrInfo();
+  const TargetRegisterInfo *TRI =
+      MBB->getParent()->getSubtarget().getRegisterInfo();
+  return getSuitableReg(OrigReg,
+                        TII->getRegClass(Desc, OpNum, TRI, *MBB->getParent()),
+                        MBB, InsertTo);
+}
+
+static Register duplicateInst(MachineInstr *MI, unsigned ReplaceOprNum,
+                              Register ReplaceReg, MachineBasicBlock &MBB,
+                              MachineBasicBlock::iterator InsertTo) {
+  MachineRegisterInfo &MRI = MBB.getParent()->getRegInfo();
+  MachineInstrBuilder MIB =
+      BuildMI(MBB, InsertTo, MI->getDebugLoc(), MI->getDesc());
+  Register Result = 0;
+  for (unsigned I = 0; I < MI->getNumOperands(); ++I) {
+    if (I == 0 && MI->getOperand(0).getReg().isVirtual()) {
+      Result = MRI.createVirtualRegister(
+          MRI.getRegClass(MI->getOperand(0).getReg()));
+      MIB.addReg(Result, RegState::Define);
+    } else if (I == ReplaceOprNum) {
+      ReplaceReg = getSuitableReg(ReplaceReg, MI->getDesc(), ReplaceOprNum,
+                                  &MBB, MIB.getInstr());
+      MIB.addReg(ReplaceReg);
+    } else {
+      MIB.add(MI->getOperand(I));
+    }
+  }
+  return Result;
+}
+
+void AArch64PipelinerLoopInfo::createRemainingIterationsGreaterCondition(
+    int TC, MachineBasicBlock &MBB, SmallVectorImpl<MachineOperand> &Cond,
+    DenseMap<MachineInstr *, MachineInstr *> LastStage0Insts) {
+  Register CondResult = MRI.createVirtualRegister(
+      TII->getRegClass(TII->get(AArch64::MOVZXi), 0, TRI, *MBB.getParent()));
+  BuildMI(MBB, MBB.end(), MVELoopInfo.Update->getDebugLoc(),
+          TII->get(AArch64::MOVZXi))
+      .addReg(CondResult, RegState::Define)
+      .addImm(0)
+      .addImm(0);
+
+  Register One = MRI.createVirtualRegister(
+      TII->getRegClass(TII->get(AArch64::MOVZXi), 0, TRI, *MBB.getParent()));
+  BuildMI(MBB, MBB.end(), MVELoopInfo.Update->getDebugLoc(),
+          TII->get(AArch64::MOVZXi))
+      .addReg(One, RegState::Define)
+      .addImm(1)
+      .addImm(0);
+  One = getSuitableReg(One, TII->get(AArch64::CSELXr), 2, &MBB, MBB.end());
+
+  assert(MVELoopInfo.CondBranch->getOpcode() == AArch64::Bcc);
+  AArch64CC::CondCode CC =
+      (AArch64CC::CondCode)MVELoopInfo.CondBranch->getOperand(0).getImm();
+  if (MVELoopInfo.IsLoopCondTrue)
+    CC = AArch64CC::getInvertedCondCode(CC);
+
+  Register CounterReg;
+  if (LastStage0Insts.empty()) {
+    CounterReg = MVELoopInfo.Init;
+    if (MVELoopInfo.IsUpdatePriorComp)
+      CounterReg =
+          duplicateInst(MVELoopInfo.Update, MVELoopInfo.UpdateCounterOprNum,
+                        CounterReg, MBB, MBB.end());
+  } else {
+    MachineInstr *Comp = LastStage0Insts[MVELoopInfo.Comp];
+    CounterReg = Comp->getOperand(MVELoopInfo.CompCounterOprNum).getReg();
+  }
+
+  for (int I = 0; I <= TC; ++I) {
+    Register UpdatedCounter =
+        duplicateInst(MVELoopInfo.Comp, MVELoopInfo.CompCounterOprNum,
+                      CounterReg, MBB, MBB.end());
+
+    CondResult = getSuitableReg(CondResult, TII->get(AArch64::CSELXr), 1, &MBB,
+                                MBB.end());
+    Register NewCondResult = MRI.createVirtualRegister(
+        TII->getRegClass(TII->get(AArch64::CSELXr), 0, TRI, *MBB.getParent()));
+    BuildMI(MBB, MBB.end(), MVELoopInfo.Comp->getDebugLoc(),
+            TII->get(AArch64::CSELXr))
+        .addReg(NewCondResult, RegState::Define)
+        .addReg(One)
+        .addReg(CondResult)
+        .addImm(CC);
+    CondResult = NewCondResult;
+
+    if (MVELoopInfo.Update != MVELoopInfo.Comp)
+      UpdatedCounter =
+          duplicateInst(MVELoopInfo.Update, MVELoopInfo.UpdateCounterOprNum,
+                        CounterReg, MBB, MBB.end());
+    CounterReg = UpdatedCounter;
+  }
+
+  CondResult = getSuitableReg(CondResult, TII->get(AArch64::SUBSXri), 1, &MBB,
+                              MBB.end());
+  BuildMI(MBB, MBB.end(), MVELoopInfo.Comp->getDebugLoc(),
+          TII->get(AArch64::SUBSXri))
+      .addReg(AArch64::XZR, RegState::Define | RegState::Dead)
+      .addReg(CondResult)
+      .addImm(1)
+      .addImm(0);
+
+  Cond.clear();
+  Cond.push_back(MachineOperand::CreateImm(AArch64CC::NE));
+}
+
+static void extractPhiReg(MachineInstr &Phi, MachineBasicBlock *MBB,
+                          Register *RegMBB, Register *RegOther) {
+  assert(Phi.getNumOperands() == 5);
+  if (Phi.getOperand(2).getMBB() == MBB) {
+    *RegMBB = Phi.getOperand(1).getReg();
+    *RegOther = Phi.getOperand(3).getReg();
+  } else {
+    assert(Phi.getOperand(4).getMBB() == MBB);
+    *RegMBB = Phi.getOperand(3).getReg();
+    *RegOther = Phi.getOperand(1).getReg();
+  }
+}
+
+static bool isDefinedOutside(Register Reg, const MachineBasicBlock *BB) {
+  if (!Reg.isVirtual())
+    return false;
+  const MachineRegisterInfo &MRI = BB->getParent()->getRegInfo();
+  return MRI.getVRegDef(Reg)->getParent() != BB;
+}
+
+/// If Reg is updated recursively by a single SUBS instruction,
+/// returns true and sets UpdateInst and InitReg.
+static bool getIndVarInfo(Register Reg, MachineBasicBlock *LoopBB,
+                          MachineInstr **UpdateInst,
+                          unsigned *UpdateCounterOprNum, Register *InitReg,
+                          bool *IsUpdatePriorComp) {
+  if (LoopBB->pred_size() != 2)
+    return false;
+  if (!Reg.isVirtual())
+    return false;
+  const MachineRegisterInfo &MRI = LoopBB->getParent()->getRegInfo();
+  *UpdateInst = nullptr;
+  *UpdateCounterOprNum = 0;
+  *InitReg = 0;
+  *IsUpdatePriorComp = true;
+  Register CurReg = Reg;
+  while (true) {
+    MachineInstr *Def = MRI.getVRegDef(CurReg);
+    if (Def->getParent() != LoopBB)
+      return false;
+    if (Def->isCopy())
+      CurReg = Def->getOperand(1).getReg();
+    else if (Def->isPHI()) {
+      if (*InitReg != 0)
+        return false;
+      if (!*UpdateInst)
+        *IsUpdatePriorComp = false;
+      extractPhiReg(*Def, LoopBB, &CurReg, InitReg);
+    } else {
+      if (*UpdateInst)
+        return false;
+      switch (Def->getOpcode()) {
+      case AArch64::ADDSXri:
+      case AArch64::ADDSWri:
+      case AArch64::SUBSXri:
+      case AArch64::SUBSWri:
+      case AArch64::ADDXri:
+      case AArch64::ADDWri:
+      case AArch64::SUBXri:
+      case AArch64::SUBWri:
+        *UpdateInst = Def;
+        *UpdateCounterOprNum = 1;
+        break;
+      case AArch64::ADDSXrr:
+      case AArch64::ADDSWrr:
+      case AArch64::SUBSXrr:
+      case AArch64::SUBSWrr:
+      case AArch64::ADDXrr:
+      case AArch64::ADDWrr:
+      case AArch64::SUBXrr:
+      case AArch64::SUBWrr:
+        *UpdateInst = Def;
+        if (isDefinedOutside(Def->getOperand(2).getReg(), LoopBB))
+          *UpdateCounterOprNum = 1;
+        else if (isDefinedOutside(Def->getOperand(1).getReg(), LoopBB))
+          *UpdateCounterOprNum = 2;
+        else
+          return false;
+        break;
+      default:
+        return false;
+      }
+      CurReg = Def->getOperand(*UpdateCounterOprNum).getReg();
+    }
+
+    if (!CurReg.isVirtual())
+      return false;
+    if (Reg == CurReg)
+      break;
+  }
+
+  if (!*UpdateInst)
+    return false;
+
+  return true;
 }
 
 std::unique_ptr<TargetInstrInfo::PipelinerLoopInfo>
@@ -9675,7 +9942,63 @@ AArch64InstrInfo::analyzeLoopForPipelining(MachineBasicBlock *LoopBB) const {
     return nullptr;
   }
 
-  return std::make_unique<AArch64PipelinerLoopInfo>(PredBranch, Cond);
+  if (CondBranch->getOpcode() != AArch64::Bcc)
+    return nullptr;
+  MachineInstr *Comp = nullptr;
+  unsigned CompCounterOprNum;
+  unsigned UpdateCounterOprNum;
+
+  for (MachineInstr &MI : reverse(*LoopBB)) {
+    if (MI.modifiesRegister(AArch64::NZCV, &TRI)) {
+      switch (MI.getOpcode()) {
+      case AArch64::SUBSXri:
+      case AArch64::SUBSWri:
+      case AArch64::ADDSXri:
+      case AArch64::ADDSWri:
+        Comp = &MI;
+        CompCounterOprNum = 1;
+        break;
+      case AArch64::ADDSWrr:
+      case AArch64::ADDSXrr:
+      case AArch64::SUBSWrr:
+      case AArch64::SUBSXrr:
+        Comp = &MI;
+        CompCounterOprNum = 0;
+        break;
+      default:
+        if (isWhileOpcode(MI.getOpcode())) {
+          Comp = &MI;
+          CompCounterOprNum = 0;
+          break;
+        }
+        return nullptr;
+      }
+
+      if (CompCounterOprNum == 0) {
+        if (isDefinedOutside(Comp->getOperand(1).getReg(), LoopBB))
+          CompCounterOprNum = 2;
+        else if (isDefinedOutside(Comp->getOperand(2).getReg(), LoopBB))
+          CompCounterOprNum = 1;
+        else
+          return nullptr;
+      }
+
+      break;
+    }
+  }
+  if (!Comp)
+    return nullptr;
+
+  MachineInstr *Update = nullptr;
+  Register Init;
+  bool IsUpdatePriorComp;
+  if (!getIndVarInfo(Comp->getOperand(CompCounterOprNum).getReg(), LoopBB,
+                     &Update, &UpdateCounterOprNum, &Init, &IsUpdatePriorComp))
+    return nullptr;
+
+  return std::make_unique<AArch64PipelinerLoopInfo>(
+      PredBranch, Cond, CondBranch, Comp, CompCounterOprNum, Update,
+      UpdateCounterOprNum, Init, IsUpdatePriorComp, TBB == LoopBB);
 }
 
 #define GET_INSTRINFO_HELPERS
